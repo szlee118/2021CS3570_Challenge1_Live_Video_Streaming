@@ -1,57 +1,159 @@
-# import tensorflow as tf
-#NN_MODEL = "./submit/results/nn_model_ep_18200.ckpt" # model path settings, if using ML-based method
+import sys
 
 class Algorithm:
      def __init__(self):
      # fill your self params
-        self.some_param = 0
+        # same value
+        self.BITRATE = [500.0, 850.0, 1200.0, 1850.0]
+        self.frame_time_len = 0.04
+        self.SKIP_PENALTY = 0.5
+        self.BITRATE_LEVEL = 4
+        self.segment_length = 51
+        self.segment_time_len = self.frame_time_len * self.segment_length
+
+        # variable value
+        self.prev_rate = 0
+        self.prev_cdn_newest_id = 0
+        self.prev_R_hat = [0] * self.BITRATE_LEVEL  # (self.BITRATE_LEVEL, )
+
+        # value need to tune
+        self.LAMBDA = 3.3  #tested
+        self.l_min = 4.0
+        self.l_max = 10.0
+        self.N_WMA = 1
+        self.N_1 = 1
+        self.beta = 0.5
+        self.buffer_threshold = 1.4
+
     
      # Initail
      def Initial(self):
      # Initail your session or something
-        self.some_param = 0
+        self.l_min = 4.0
+        self.l_max = 10.0
+        self.beta = 0.5
+
+        # calculated value
+        self.R_history = [[0] * self.N_1 for _ in range(self.BITRATE_LEVEL)] # (self.BITRATE_LEVEL, self.N_1)
+        self.C_denominator = self.N_WMA * (self.N_WMA + 1) / 2
+        self.SC_slowest = 2/(self.l_max + 1)
+        self.SC_fastest = 2/(self.l_min + 1)
 
      # Define your algo
-     def run(self, time, S_time_interval, S_send_data_size, S_chunk_len, S_rebuf, S_buffer_size, S_play_time_len,S_end_delay, S_decision_flag, S_buffer_flag,S_cdn_flag,S_skip_time, end_of_video, cdn_newest_id,download_id,cdn_has_frame,IntialVars):
-
+     def run(self, time, S_time_interval, S_send_data_size, S_chunk_len, S_rebuf, S_buffer_size, 
+     S_play_time_len,S_end_delay, S_decision_flag, S_buffer_flag, S_cdn_flag, S_skip_time, 
+     end_of_video, cdn_newest_id, download_id, cdn_has_frame, IntialVars):
+        #  print(f"S_send_data_size : {S_send_data_size}")
+        #  print(f"S_send_data_size : {S_send_data_size}, S_chunk_len : {S_chunk_len}, cdn_has_frame : {cdn_has_frame}")
          # If you choose the marchine learning
-         '''state = []
+         '''
+         V_nm is coding bitrate
+         R_nm is actual bitrate
+         R^hat is predicted actual bitrate, use n to predict n+1
+         SC   is smoothing factor 
+         ER   is efficient ratio
+         N_1  is # of samples used to calculate ER
+         D    is estimated latency(need to minimize)
+         d    is segment length (50*frame_time_len ?)
+         T    is downloading time of next segment
+         C    is throughput estimate by weighted moving average
+         N_WMA   # of sample used to estimated C
+         B    is estimated buffer occupancy
+         v       estimated frame accumulation speed in CDN
+         '''
+         buf_now = S_buffer_size[-1]
+         bit_rate = 0
 
-         state[0] = ...
-         state[1] = ...
-         state[2] = ...
-         state[3] = ...
-         state[4] = ...
+         # bitrate control
 
-         decision = actor.predict(state).argmax()
-         bit_rate, target_buffer = decison//4, decison % 4 .....
-         return bit_rate, target_buffer'''
+         # estimate c (throughput) using weighted moving average (bps)
+         C_numerator = 0
+         for i in range(self.N_WMA):
+             if S_time_interval[-i-1] != 0:
+                C_numerator += (self.N_WMA - i) * (S_send_data_size[-i-1] / S_time_interval[-i-1])
+         estimated_C = C_numerator / self.C_denominator
+         estimated_C = max(0.000001, estimated_C)
 
-         # If you choose BBA
-         RESEVOIR = 0.5
-         CUSHION =  1.5
-         
-         if S_buffer_size[-1] < RESEVOIR:
-             bit_rate = 0    
-         elif S_buffer_size[-1] >= RESEVOIR + CUSHION and S_buffer_size[-1] < CUSHION +CUSHION:
-             bit_rate = 2
-         elif S_buffer_size[-1] >= CUSHION + CUSHION:
-             bit_rate = 3
+         ## estimate R_hat for every bitrate using KAMA
+         ## R : bps
+         min_estimate_latency = sys.maxsize
+         prev_R  = sum(S_send_data_size[-50:]) / self.segment_time_len
+         for b in range(self.BITRATE_LEVEL):
+            self.R_history[b].append(prev_R * (self.BITRATE[b] / self.BITRATE[self.prev_rate]))
+            
+            # calculate ER =  change / volatility
+            change = abs(self.R_history[b][-1] - self.R_history[b][0])
+            volatility = 0
+            for i in range(self.N_1):
+                volatility += abs(self.R_history[b][i] - self.R_history[b][i+1])
+            volatility = max(0.000001, volatility)
+            ER = change / volatility
+            
+            self.R_history[b].pop(0)
+
+            # calculate SC
+            SC = (ER*(self.SC_fastest - self.SC_slowest) + self.SC_slowest) ** 2
+
+            # R_hat = R_n+1_m
+            R_hat = (1 - SC) * self.prev_R_hat[b] + SC * self.R_history[b][-1]
+
+            # calculate T
+            T = R_hat * self.frame_time_len*self.segment_length / estimated_C
+
+            # calculate B
+
+            if buf_now < 0.5:
+                gamma = 0.95
+            elif buf_now > 1.0:
+                gamma = 1.05
+            else:
+                gamma = 1
+            
+                
+            B = max(buf_now + self.frame_time_len*self.segment_length - gamma * T, 0)
+
+            # calculate 
+            v = self.beta * (cdn_newest_id - self.prev_cdn_newest_id) * self.frame_time_len / sum(S_time_interval[-50:])
+            # latency caused by accumulated video at CDN after next downloading interval
+            D_cdn = max((cdn_newest_id - download_id)*self.frame_time_len + v*T - self.frame_time_len*self.segment_length, 0)
+
+            if min_estimate_latency > B + D_cdn and B > self.buffer_threshold:
+                min_estimate_latency = B + D_cdn
+                bit_rate = b
+
+            # for next segment
+            self.prev_R_hat[b] = R_hat
+
+         # determine target buffer by buffer size
+         # if in [B^0_min, B^0_max), target_buffer = 1
+         # otherwise, target_buffer = 0
+         buf_now = S_buffer_size[-1]
+         if 0.3 <= buf_now and buf_now < 1.0:
+             target_buffer = 1
          else:
-             bit_rate = 1
+             target_buffer = 0
 
-         target_buffer = 0
-         latency_limit = 4
+         # QoE based latency limit
+         # LAMBDA may need tuning (3.3 is currently best)
+         '''
+         LATENCY_PENALTY = 0.005
+         if S_end_delay[-1] <=1.0:
+            LATENCY_PENALTY = 0.005
+         else:
+            LATENCY_PENALTY = 0.01
 
+         latency_limit = self.frame_time_len * (self.BITRATE[bit_rate]/1000.0 + self.SKIP_PENALTY) / (LATENCY_PENALTY * self.LAMBDA)
+         '''
+         latency_limit = 1.8  # fixed latency is better than prediction
 
+         # for next iteration
+         self.prev_rate = bit_rate
+         self.prev_cdn_newest_id = cdn_newest_id
 
          return bit_rate, target_buffer, latency_limit
 
-         # If you choose other
-         #......
-
-
-
+         
+     
      def get_params(self):
      # get your params
         your_params = []
